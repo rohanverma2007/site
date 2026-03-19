@@ -245,12 +245,13 @@ func addSidenotes(in string) string {
 		}
 
 		return `<span class="fn-wrap">` +
-			`<sup class="fn-ref"><button class="fn-btn" type="button" aria-expanded="false">` + label + `</button></sup>` +
+			`<sup class="fn-ref"><a class="fn-btn" href="#fn-` + label + `">` + label + `</a></sup>` +
 			`<span class="sidenote"><span class="sn-num">` + label + `</span> ` + note + `</span>` +
-			`<span class="fn-popup"><span class="sn-num">` + label + `</span> ` + note + `</span>` +
-			`</span>`
+			`<span class="fn-popup" id="fn-` + label + `"><span class="sn-num">` + label + `</span> ` + note + `</span>` +
+		`</span>`
 	})
-	out = reFootnoteBlock.ReplaceAllString(out, "")
+	cleanBlock := reBackref.ReplaceAllString(block, "")
+	out = strings.Replace(out, block, cleanBlock, 1)
 	return out
 }
 
