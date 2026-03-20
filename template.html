@@ -1,7 +1,7 @@
 {{define "nav"}}
 <ul>
 	{{range .}}
-	{{if not (or (eq .Seg "fonts") (eq .Seg "images"))}}
+	{{if not (or (eq .Name "fonts/") (eq .Name "images/"))}}
 	<li>
 		{{if .Items}}
 			<span class="folder-label"><span class="arr">▼</span>{{.Name}}</span>

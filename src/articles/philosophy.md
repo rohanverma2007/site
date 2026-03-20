@@ -16,7 +16,7 @@ These companies truly believe that locking down their devices to be as much of a
 
 Currently, [Louis Rossman](https://en.wikipedia.org/wiki/Louis_Rossmann) has been at the forefront of the [Right To Repair](https://en.wikipedia.org/wiki/Right_to_repair) movement. A lot of companies choose to follow this practice because so much money comes from repairing; they get so much money and scam you into thinking that the device you have has to use ["certified tools" from a "certified technician."](https://support.apple.com/en-il/120555)[^5]
 
-[^1]: This website is using a template.html that is ~550 LoC (lines of code) and is made to look really easy to work on, a static stie generator created by Faisal Alammar named ussg is used to turn markdown files into html files.
+[^1]: This website is using a template.html that is ~550 LoC (lines of code) and is made to look really easy to work on, it's also using a static site generator created by Faisal Alammar named sitegen is used to turn markdown files into html files, written in Go.
 [^2]: Microsoft Windows is typically criticized of this, they have so many useless apps preinstalled, I don't need the LinkedIn app.
 [^3]: A system that is self-contained within an enterprise. Closed systems do not have an inter-enterprise subsystem.
 [^4]: It's also been working flawlessly, I have been able to convert my old 2014 Macbook Air into using OpenBSD and it's been running excellently.

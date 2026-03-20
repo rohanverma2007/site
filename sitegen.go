@@ -32,42 +32,24 @@ import (
 	"flag"
 	"fmt"
 	"github.com/yuin/goldmark"
-	"github.com/yuin/goldmark/renderer/html"
 	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/renderer/html"
 	"html/template"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
-	"regexp"
 )
-
-var (
-	args     Args
-	nav      []Nav
-	dirCache = map[string][]os.DirEntry{}
-	wg       sync.WaitGroup
-	md       goldmark.Markdown
-	tpl      *template.Template
-)
-
-type Args struct {
-	srcDir        string
-	dstDir        string
-	tplFile       string
-	siteName      string
-	nWorkers      int
-	shouldRebuild bool
-}
 
 type Nav struct {
-	Seg      string
+	seg      string
 	Name     string
 	Path     string
 	Items    []Nav
-	Selected bool
+	selected bool
 }
 
 type Page struct {
@@ -83,37 +65,64 @@ type Job struct {
 	walk    []string
 }
 
-func main() {
-	flag.StringVar(&args.srcDir, "src", "", "source directory")
-	flag.StringVar(&args.dstDir, "dst", "", "destination directory")
-	flag.StringVar(&args.tplFile, "tpl", "", "template file")
-	flag.StringVar(&args.siteName, "site", "", "site name")
-	flag.IntVar(&args.nWorkers, "nworkers", 1, "number of workers to spawn")
-	flag.BoolVar(&args.shouldRebuild, "reb", false, "rebuild all sources")
+var (
+	srcDir        string
+	dstDir        string
+	tplFile       string
+	siteName      string
+	ignorePat     string
+	numWorkers    int
+	shouldRebuild bool
 
+	tpl      *template.Template
+	ignoreRe *regexp.Regexp
+	md       goldmark.Markdown
+	dirCache map[string][]os.DirEntry
+	wg       sync.WaitGroup
+	navTree  []Nav
+)
+
+func main() {
+	flag.StringVar(&srcDir, "i", "", "input dir (required)")
+	flag.StringVar(&dstDir, "o", "", "output dir (required)")
+	flag.StringVar(&tplFile, "t", "", "template file (required)")
+	flag.StringVar(&siteName, "s", "", "site name (required)")
+	flag.StringVar(&ignorePat, "x", "", "ignore files that match regexp")
+	flag.IntVar(&numWorkers, "w", 1, "number of workers (0 for nproc)")
+	flag.BoolVar(&shouldRebuild, "r", false, "rebuild all inputs")
 	flag.Parse()
 
-	if args.srcDir == "" {
-		fatal("missing -src")
+	missing := []string{}
+	if srcDir == "" {
+		missing = append(missing, "-src")
 	}
-	if args.dstDir == "" {
-		fatal("missing -dst")
+	if dstDir == "" {
+		missing = append(missing, "-dst")
 	}
-	if args.tplFile == "" {
-		fatal("missing -tpl")
+	if tplFile == "" {
+		missing = append(missing, "-tpl")
 	}
-	if args.siteName == "" {
-		fatal("missing -site")
+	if siteName == "" {
+		missing = append(missing, "-site")
+	}
+	if len(missing) > 0 {
+		fatal("missing %v, see -h for usage", missing)
 	}
 
-	err := os.MkdirAll(args.dstDir, 0755)
+	err := os.MkdirAll(dstDir, 0755)
 	check(err)
 
-	tpl, err = template.ParseFiles(args.tplFile)
+	tpl, err = template.ParseFiles(tplFile)
 	check(err)
 
-	if args.nWorkers == 0 {
-		args.nWorkers = runtime.NumCPU()
+	if numWorkers == 0 {
+		numWorkers = runtime.NumCPU()
+	}
+
+	if ignorePat != "" {
+		var err error
+		ignoreRe, err = regexp.Compile(ignorePat)
+		check(err)
 	}
 
 	md = goldmark.New(
@@ -126,29 +135,28 @@ func main() {
 		),
 	)
 
-	nav = mkNav(args.srcDir)
+	dirCache = make(map[string][]os.DirEntry)
+
+	navTree = mkNav(srcDir)
 
 	jobs := make(chan Job)
-
-	for i := 0; i < args.nWorkers; i++ {
+	for i := 0; i < numWorkers; i++ {
 		go worker(jobs)
 	}
-
-	build(args.srcDir, []string{}, jobs)
-
+	build(srcDir, []string{}, jobs)
 	close(jobs)
-
 	wg.Wait()
 }
 
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(1)
 }
 
-func check(e error) {
-	if e != nil {
-		fatal(e.Error())
+func check(err error) {
+	if err != nil {
+		fatal("%s", err.Error())
 	}
 }
 
@@ -162,30 +170,31 @@ func mkNav(cwd string) []Nav {
 
 	for _, e := range entries {
 		name := e.Name()
+		if ignoreMatches(name) {
+			continue
+		}
+
 		path := filepath.Join(cwd, name)
-		relPath, _ := filepath.Rel(args.srcDir, path)
+		rel, _ := filepath.Rel(srcDir, path)
 
 		if e.IsDir() {
 			n = append(n, Nav{
-				Seg:      name,
+				seg:      name,
 				Name:     name + "/",
-				Path:     "/" + relPath + "/",
+				Path:     "/" + rel + "/",
 				Items:    mkNav(path),
-				Selected: false,
+				selected: false,
 			})
 		} else {
-			if name == "index.md" || name == "index.html" {
+			if isIndexFile(name) {
 				continue
 			}
 
-			if strings.HasSuffix(name, ".md") {
+			if hasMdExt(name) {
 				n = append(n, Nav{
-					Seg:  name,
+					seg:  name,
 					Name: getPageName(name),
-					Path: "/" + strings.TrimSuffix(
-						relPath,
-						".md",
-					) + ".html",
+					Path: "/" + replaceMdWithHtmlExt(rel),
 				})
 			}
 		}
@@ -194,8 +203,24 @@ func mkNav(cwd string) []Nav {
 	return n
 }
 
+func ignoreMatches(s string) bool {
+	return ignoreRe != nil && ignoreRe.MatchString(s)
+}
+
+func isIndexFile(s string) bool {
+	return s == "index.md" || s == "index.html"
+}
+
+func hasMdExt(s string) bool {
+	return strings.HasSuffix(s, ".md")
+}
+
 func getPageName(s string) string {
 	return strings.ReplaceAll(strings.TrimSuffix(s, ".md"), "-", " ")
+}
+
+func replaceMdWithHtmlExt(s string) string {
+	return strings.TrimSuffix(s, ".md") + ".html"
 }
 
 func addSidenotes(in string) string {
@@ -267,14 +292,12 @@ func worker(jobs <-chan Job) {
 		srcFile, err := os.Open(j.srcPath)
 		check(err)
 
-		isMdFile := strings.HasSuffix(j.srcPath, ".md")
+		isMdFile := hasMdExt(j.srcPath)
 		if isMdFile {
-			j.dstPath = strings.TrimSuffix(
-				j.dstPath, ".md",
-			) + ".html"
+			j.dstPath = replaceMdWithHtmlExt(j.dstPath)
 		}
 
-		if !args.shouldRebuild {
+		if !shouldRebuild {
 			srcStat, err := srcFile.Stat()
 			check(err)
 
@@ -284,9 +307,7 @@ func worker(jobs <-chan Job) {
 					fmt.Println(err)
 					os.Exit(1)
 				}
-			} else if !srcStat.ModTime().After(
-				dstStat.ModTime(),
-			) {
+			} else if !srcStat.ModTime().After(dstStat.ModTime()) {
 				srcFile.Close()
 				wg.Done()
 
@@ -314,29 +335,30 @@ func procFile(
 	walk []string,
 	isMd bool,
 	bin, bout *bytes.Buffer,
-	w *bufio.Writer,
+	bwriter *bufio.Writer,
 ) {
 	if !isMd {
 		_, err := io.Copy(dst, src)
 		check(err)
+
 		return
 	}
 
 	path := src.Name()
 	name := filepath.Base(path)
 
-	var p Page
-	p.SiteName = args.siteName
+	var page Page
+	page.SiteName = siteName
 
-	if name == "index.md" {
+	if isIndexFile(name) {
 		dir := filepath.Dir(path)
-		if dir == args.srcDir {
-			p.Name = args.siteName
+		if dir == srcDir {
+			page.Name = siteName
 		} else {
-			p.Name = filepath.Base(dir)
+			page.Name = filepath.Base(dir)
 		}
 	} else {
-		p.Name = getPageName(name)
+		page.Name = getPageName(name)
 	}
 
 	bin.ReadFrom(src)
@@ -346,15 +368,15 @@ func procFile(
 
 	htmlOut := bout.String()
 	htmlOut = addSidenotes(htmlOut)
-	p.Content = template.HTML(htmlOut)
-	p.Items = getItems(nav, walk)
+	page.Content = template.HTML(htmlOut)
+	page.Items = getItems(navTree, walk)
 
-	w.Reset(dst)
+	bwriter.Reset(dst)
 
-	err = tpl.Execute(w, p)
+	err = tpl.Execute(bwriter, page)
 	check(err)
 
-	w.Flush()
+	bwriter.Flush()
 }
 
 func getItems(nav []Nav, walk []string) []Nav {
@@ -363,12 +385,12 @@ func getItems(nav []Nav, walk []string) []Nav {
 	}
 
 	for i, n := range nav {
-		if n.Seg == walk[0] {
+		if n.seg == walk[0] {
 			item := n
-			item.Selected = true
+			item.selected = true
 			item.Items = getItems(n.Items, walk[1:])
 
-			result := make([]Nav, i+1)
+			result := make([]Nav, len(nav))
 			copy(result, nav[:i])
 			result[i] = item
 
@@ -383,22 +405,30 @@ func build(cwd string, walk []string, jobs chan<- Job) {
 	entries := readDir(cwd)
 	for _, e := range entries {
 		name := e.Name()
-		srcPath := filepath.Join(cwd, name)
-		relPath, _ := filepath.Rel(args.srcDir, srcPath)
-		dstPath := filepath.Join(args.dstDir, relPath)
+
+		if ignoreMatches(name) {
+			continue
+		}
+
+		src := filepath.Join(cwd, name)
+		rel, _ := filepath.Rel(srcDir, src)
+		dst := filepath.Join(dstDir, rel)
 
 		if e.IsDir() {
-			err := os.MkdirAll(dstPath, 0755)
+			err := os.MkdirAll(dst, 0755)
 			check(err)
-
-			build(srcPath, append(walk, name), jobs)
+			build(src, append(walk, name), jobs)
 		} else {
-			wg.Add(1)
+			newWalk := append(walk, name)
+			if isIndexFile(name) {
+				newWalk = walk
+			}
 
+			wg.Add(1)
 			jobs <- Job{
-				srcPath: srcPath,
-				dstPath: dstPath,
-				walk:    walk,
+				srcPath: src,
+				dstPath: dst,
+				walk:    newWalk,
 			}
 		}
 	}
