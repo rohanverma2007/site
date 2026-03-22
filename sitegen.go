@@ -15,7 +15,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND ANY
 // EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 // WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-// DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR ANY
+// DISCLAIMED. IN NO EVENT SHALL THE AUTHOR AND CONTRIBUTORS BE LIABLE FOR ANY
 // DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 // (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
@@ -31,9 +31,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/yuin/goldmark"
-	"github.com/yuin/goldmark/extension"
-	"github.com/yuin/goldmark/renderer/html"
 	"html/template"
 	"io"
 	"os"
@@ -42,6 +39,13 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/tdewolff/minify/v2"
+	mincss "github.com/tdewolff/minify/v2/css"
+	minhtml "github.com/tdewolff/minify/v2/html"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	gmhtml "github.com/yuin/goldmark/renderer/html"
 )
 
 type Nav struct {
@@ -57,6 +61,7 @@ type Page struct {
 	Name     string
 	Content  template.HTML
 	Items    []Nav
+	IsHome   bool
 }
 
 type Job struct {
@@ -77,6 +82,7 @@ var (
 	tpl      *template.Template
 	ignoreRe *regexp.Regexp
 	md       goldmark.Markdown
+	minifier *minify.M
 	dirCache map[string][]os.DirEntry
 	wg       sync.WaitGroup
 	navTree  []Nav
@@ -94,16 +100,16 @@ func main() {
 
 	missing := []string{}
 	if srcDir == "" {
-		missing = append(missing, "-src")
+		missing = append(missing, "-i")
 	}
 	if dstDir == "" {
-		missing = append(missing, "-dst")
+		missing = append(missing, "-o")
 	}
 	if tplFile == "" {
-		missing = append(missing, "-tpl")
+		missing = append(missing, "-t")
 	}
 	if siteName == "" {
-		missing = append(missing, "-site")
+		missing = append(missing, "-s")
 	}
 	if len(missing) > 0 {
 		fatal("missing %v, see -h for usage", missing)
@@ -120,7 +126,6 @@ func main() {
 	}
 
 	if ignorePat != "" {
-		var err error
 		ignoreRe, err = regexp.Compile(ignorePat)
 		check(err)
 	}
@@ -131,18 +136,22 @@ func main() {
 			extension.Footnote,
 		),
 		goldmark.WithRendererOptions(
-			html.WithUnsafe(),
+			gmhtml.WithUnsafe(),
 		),
 	)
 
-	dirCache = make(map[string][]os.DirEntry)
+	minifier = minify.New()
+	minifier.AddFunc("text/html", minhtml.Minify)
+	minifier.AddFunc("text/css", mincss.Minify)
 
+	dirCache = make(map[string][]os.DirEntry)
 	navTree = mkNav(srcDir)
 
 	jobs := make(chan Job)
 	for i := 0; i < numWorkers; i++ {
 		go worker(jobs)
 	}
+
 	build(srcDir, []string{}, jobs)
 	close(jobs)
 	wg.Wait()
@@ -165,7 +174,6 @@ func mkNav(cwd string) []Nav {
 
 	entries, err := os.ReadDir(cwd)
 	check(err)
-
 	dirCache[cwd] = entries
 
 	for _, e := range entries {
@@ -185,18 +193,19 @@ func mkNav(cwd string) []Nav {
 				Items:    mkNav(path),
 				selected: false,
 			})
-		} else {
-			if isIndexFile(name) {
-				continue
-			}
+			continue
+		}
 
-			if hasMdExt(name) {
-				n = append(n, Nav{
-					seg:  name,
-					Name: getPageName(name),
-					Path: "/" + replaceMdWithHtmlExt(rel),
-				})
-			}
+		if isIndexFile(name) {
+			continue
+		}
+
+		if hasMdExt(name) {
+			n = append(n, Nav{
+				seg:  name,
+				Name: getPageName(name),
+				Path: "/" + replaceMdWithHtmlExt(rel),
+			})
 		}
 	}
 
@@ -221,6 +230,36 @@ func getPageName(s string) string {
 
 func replaceMdWithHtmlExt(s string) string {
 	return strings.TrimSuffix(s, ".md") + ".html"
+}
+
+func sanitizeIDPart(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "note"
+	}
+
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == ':':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+
+	out := b.String()
+	out = strings.Trim(out, "-")
+	if out == "" {
+		return "note"
+	}
+	return out
 }
 
 func addSidenotes(in string) string {
@@ -253,8 +292,8 @@ func addSidenotes(in string) string {
 			return s
 		}
 
-		refID := m[1]
-		noteID := m[2]
+		refID := sanitizeIDPart(m[1])
+		noteID := sanitizeIDPart(m[2])
 		label := strings.TrimSpace(m[3])
 
 		note, ok := notes[noteID]
@@ -269,14 +308,16 @@ func addSidenotes(in string) string {
 			label = noteID
 		}
 
+		toggleID := "fn-toggle-" + noteID
+
 		return `<span class="fn-wrap">` +
-			`<sup class="fn-ref"><a class="fn-btn" href="#fn-` + label + `">` + label + `</a></sup>` +
+			`<sup class="fn-ref"><label class="fn-btn" for="` + toggleID + `">` + label + `</label></sup>` +
+			`<input class="fn-toggle" type="checkbox" id="` + toggleID + `">` +
 			`<span class="sidenote"><span class="sn-num">` + label + `</span> ` + note + `</span>` +
-			`<span class="fn-popup" id="fn-` + label + `"><span class="sn-num">` + label + `</span> ` + note + `</span>` +
-		`</span>`
+			`<span class="fn-popup"><span class="sn-num">` + label + `</span> ` + note + `</span>` +
+			`</span>`
 	})
-	cleanBlock := reBackref.ReplaceAllString(block, "")
-	out = strings.Replace(out, block, cleanBlock, 1)
+
 	return out
 }
 
@@ -304,13 +345,11 @@ func worker(jobs <-chan Job) {
 			dstStat, err := os.Stat(j.dstPath)
 			if err != nil {
 				if !os.IsNotExist(err) {
-					fmt.Println(err)
-					os.Exit(1)
+					check(err)
 				}
 			} else if !srcStat.ModTime().After(dstStat.ModTime()) {
 				srcFile.Close()
 				wg.Done()
-
 				continue
 			}
 		}
@@ -337,10 +376,11 @@ func procFile(
 	bin, bout *bytes.Buffer,
 	bwriter *bufio.Writer,
 ) {
+	_ = bwriter
+
 	if !isMd {
 		_, err := io.Copy(dst, src)
 		check(err)
-
 		return
 	}
 
@@ -354,6 +394,7 @@ func procFile(
 		dir := filepath.Dir(path)
 		if dir == srcDir {
 			page.Name = siteName
+			page.IsHome = true
 		} else {
 			page.Name = filepath.Base(dir)
 		}
@@ -361,9 +402,10 @@ func procFile(
 		page.Name = getPageName(name)
 	}
 
-	bin.ReadFrom(src)
+	_, err := bin.ReadFrom(src)
+	check(err)
 
-	err := md.Convert(bin.Bytes(), bout)
+	err = md.Convert(bin.Bytes(), bout)
 	check(err)
 
 	htmlOut := bout.String()
@@ -371,12 +413,19 @@ func procFile(
 	page.Content = template.HTML(htmlOut)
 	page.Items = getItems(navTree, walk)
 
-	bwriter.Reset(dst)
-
-	err = tpl.Execute(bwriter, page)
+	var rendered bytes.Buffer
+	err = tpl.Execute(&rendered, page)
 	check(err)
 
-	bwriter.Flush()
+	minified, err := minifier.Bytes("text/html", rendered.Bytes())
+	if err != nil {
+		_, err = dst.Write(rendered.Bytes())
+		check(err)
+		return
+	}
+
+	_, err = dst.Write(minified)
+	check(err)
 }
 
 func getItems(nav []Nav, walk []string) []Nav {
@@ -391,9 +440,8 @@ func getItems(nav []Nav, walk []string) []Nav {
 			item.Items = getItems(n.Items, walk[1:])
 
 			result := make([]Nav, len(nav))
-			copy(result, nav[:i])
+			copy(result, nav)
 			result[i] = item
-
 			return result
 		}
 	}
@@ -405,7 +453,6 @@ func build(cwd string, walk []string, jobs chan<- Job) {
 	entries := readDir(cwd)
 	for _, e := range entries {
 		name := e.Name()
-
 		if ignoreMatches(name) {
 			continue
 		}
@@ -418,18 +465,19 @@ func build(cwd string, walk []string, jobs chan<- Job) {
 			err := os.MkdirAll(dst, 0755)
 			check(err)
 			build(src, append(walk, name), jobs)
-		} else {
-			newWalk := append(walk, name)
-			if isIndexFile(name) {
-				newWalk = walk
-			}
+			continue
+		}
 
-			wg.Add(1)
-			jobs <- Job{
-				srcPath: src,
-				dstPath: dst,
-				walk:    newWalk,
-			}
+		newWalk := append(walk, name)
+		if isIndexFile(name) {
+			newWalk = walk
+		}
+
+		wg.Add(1)
+		jobs <- Job{
+			srcPath: src,
+			dstPath: dst,
+			walk:    newWalk,
 		}
 	}
 }
@@ -441,8 +489,6 @@ func readDir(path string) []os.DirEntry {
 
 	entries, err := os.ReadDir(path)
 	check(err)
-
 	dirCache[path] = entries
-
 	return entries
 }
